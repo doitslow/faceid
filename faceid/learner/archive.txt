@@ -1,0 +1,48 @@
+
+def get_eval_loader(self, dataset_class: Dataset, data_info: dict) -> DataLoader:
+    self.log("Loading evaluation dataset '{}' with class {}".format(
+        data_info['tag'] if 'tag' in data_info.keys() else "missing tag", dataset_class))
+    dataset = dataset_class(data_info, **self.config)
+    loader = DataLoader(dataset, batch_size=self.loader_batch, pin_memory=True, num_workers=4)
+
+    return loader
+
+def calc_score(model, loader, batch_size, embed_size):
+    """
+        model: loaded model up to embedding, in nn.DataParallel
+        dataloader: gives img_tensor and label
+    """
+    feature = torch.Tensor(len(loader.dataset), embed_size)
+    label = np.zeros(len(loader.dataset), dtype=int)
+    with torch.no_grad():
+        for i, (imgs, lbls) in tqdm(enumerate(loader)):
+            embeds = model(imgs)
+            # !!!!!!!! numpy array accept index exceed maximum length !!!!!!!!!!!!!!
+            feature[i * batch_size : (i + 1) * batch_size] = embeds
+            label[i * batch_size : (i + 1) * batch_size] = lbls.numpy()
+    feature = F.normalize(feature)  # feature embeddings for entire dataset
+    score = F.linear(feature, feature, bias=None)  # predicted similarity for entire dataset
+    del feature  # empty the memory
+    # ----------- extract upper triangular -----------
+    score = score[np.triu_indices(label.shape[0], k=1)]  # k=1 shifts right 1 step
+    score = score.cpu().numpy()
+
+    return score, label
+
+@adapt_dist
+def eval(self, loaders, model, ckpt_name=None, embed_size=None):
+    """Save the entire roc curve into csv file"""
+    if embed_size is None:
+        embed_size = model.module.embed_size
+    if ckpt_name is None:
+        ckpt_name = self.ckpt_name + '-{:02d}'.format(self.epoch)
+    model.eval()
+    for loader in loaders:
+        tag = loader.dataset.tag if hasattr(loader.dataset, 'tag') else 'missing_tag'
+        score, label = calc_score(model, loader, self.loader_batch, embed_size)
+        self.write_eval_results(score, label, tag, ckpt_name)
+
+# backbone_params = list(filter(lambda kv: 'backbone' in kv[0], model.named_parameters()))
+# head_params = list(filter(lambda kv: 'head' in kv[0], model.named_parameters()))
+# backbone_params = [kv[-1] for kv in backbone_params]
+# head_params = [kv[-1] for kv in head_params]
